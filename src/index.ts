@@ -827,18 +827,148 @@ function sliceSection(text: string, heading: RegExp, next: RegExp): string | nul
  *
  * The lesson generalises: when a page tells you what each fragment IS, use
  * that, rather than inferring meaning from where the fragment sits.
+ *
+ * LATENCY / CACHE (fleet #2829): a third external catalog review measured
+ * ~20s reported latency here. AE over the 7 days to 2026-10-08 showed why:
+ * 173 of 321 wi_statute calls (54%) came back status 500 at an average
+ * 19,856ms, while the 139 that succeeded (status 200) averaged only 1,737ms.
+ * Reproduced live: `wi_statute({section:"940.195"})` → "Wisconsin Legislature
+ * returned HTTP 522 for 940.195" at 21.0s wall clock. HTTP 522 is Cloudflare's
+ * own "connection to origin timed out" — docs.legis.wisconsin.gov sits behind
+ * Cloudflare, and more than half of real calls are hitting an origin CF
+ * cannot reach within its own ~19-20s window. Nothing we do changes that
+ * origin's reliability, so the fix has two parts:
+ *   1. Cache a successfully-fetched section page in KV (injected as
+ *      `_cacheKv`, the gateway's shared IDENTITY_KV — same binding and
+ *      pattern as spain-tenders' injectCacheKv, fleet #2769), keyed on the
+ *      section URL rather than caller args, so once ANY caller gets a
+ *      section through, every later lookup of that SAME section — including
+ *      ones that land during an outage — is served from KV in well under
+ *      100ms instead of waiting out another ~20s failure.
+ *   2. Bound the live fetch to 10s instead of the shared 25s default
+ *      (DEFAULT_FETCH_TIMEOUT_MS): every real success observed over 7 days
+ *      landed under ~2.5s, and the natural upstream failure arrives around
+ *      19-20s, so 10s cannot cut off a genuine answer — it only halves the
+ *      wait for the half of calls that were always going to fail anyway.
+ * A true miss (never cached, live fetch fails) stays exactly the loud
+ * `upstream_down`-classified error it always was — never a silent empty
+ * result.
  */
-
-// Bound every fetch() in this pack to a fixed timeout — an upstream that
-// degrades without erroring would otherwise hold the Worker in `await fetch()`
-// until its own execution budget kills the request (minutes, not seconds).
-// Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
-async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'Wisconsin Statutes');
-}
 
 const BASE = 'https://docs.legis.wisconsin.gov/document/statutes/';
 const UA = 'pipeworx-mcp-wisconsin-code/1.0 (+https://pipeworx.io)';
+
+// See the module comment above (fleet #2829) for why this is 10s rather than
+// the shared 25s default: the upstream's own ~19-20s failure window is what
+// made the uncached path slow, not a lack of patience on our side.
+const LIVE_FETCH_TIMEOUT_MS = 10_000;
+
+// -- section-page cache (KV, injected as _cacheKv) ---------------------------
+interface KvLike {
+  get(key: string, type: 'json'): Promise<unknown>;
+  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+}
+
+interface CachedPage {
+  cachedAt: number; // epoch ms this page was last fetched live
+  html: string;
+}
+
+type CacheMeta = {
+  stale: boolean;
+  cacheAgeSec: number;
+  servedFrom: 'fresh-cache' | 'stale-cache' | 'upstream';
+};
+
+const CACHE_KEY_PREFIX = 'wisconsin_code:page:';
+// Statute text changes only when a session acts on a bill — not daily — so a
+// day-old copy is still correct essentially always.
+const FRESH_SEC = 24 * 60 * 60;
+// Past the fresh window, keep answering from the last fetch as a fallback
+// (flagged stale) for up to 13 more days before giving up and going loud —
+// a stale but correct statute beats a timeout for a caller doing legal
+// research.
+const STALE_MAX_SEC = 13 * 24 * 60 * 60;
+const KV_RETENTION_SEC = 20 * 24 * 60 * 60;
+
+function kvFromArgs(args: Record<string, unknown>): KvLike | undefined {
+  const kv = args._cacheKv;
+  return kv && typeof (kv as KvLike).get === 'function' && typeof (kv as KvLike).put === 'function'
+    ? (kv as KvLike)
+    : undefined;
+}
+
+// One upstream fetch per section in flight at a time within this isolate —
+// a burst of concurrent callers all missing the KV cache pays the cold fetch
+// once, not once per caller.
+const INFLIGHT = new Map<string, Promise<{ status: number; html: string }>>();
+
+async function fetchSectionLive(url: string, raw: string): Promise<{ status: number; html: string }> {
+  const res = await fetchWithTimeout(
+    url, { headers: { 'User-Agent': UA } }, 'Wisconsin Statutes', LIVE_FETCH_TIMEOUT_MS,
+  );
+  if (res.status === 404) return { status: 404, html: '' };
+  if (!res.ok) throw new Error(`Wisconsin Legislature returned HTTP ${res.status} for ${raw}`);
+  return { status: 200, html: await res.text() };
+}
+
+// Cache-first wrapper (fleet #2829):
+//   1. Fresh KV hit — answer with ZERO upstream fetch.
+//   2. Miss/stale — fetch upstream (de-duped per isolate via INFLIGHT), then
+//      write the fresh copy to KV.
+//   3. Upstream fetch fails — serve a still-usable KV copy (< STALE_MAX_SEC
+//      past its freshness window) flagged `stale: true`, rather than
+//      failing the call.
+//   4. No cache at all and upstream fails — rethrow. A true miss stays a
+//      loud `upstream_down`-classified error, never a silent empty result.
+async function fetchSectionPage(
+  url: string, raw: string, kv: KvLike | undefined,
+): Promise<{ status: 404 } | { status: 200; html: string; cache: CacheMeta }> {
+  const key = CACHE_KEY_PREFIX + raw;
+  const now = Date.now();
+
+  let cached: CachedPage | null = null;
+  if (kv) {
+    try {
+      cached = (await kv.get(key, 'json')) as CachedPage | null;
+    } catch {
+      cached = null; // caching is an optimization; a KV read failure must not fail the call
+    }
+  }
+  const cacheAgeSec = cached ? Math.max(0, Math.round((now - cached.cachedAt) / 1000)) : null;
+
+  if (cached && cacheAgeSec !== null && cacheAgeSec < FRESH_SEC) {
+    return { status: 200, html: cached.html, cache: { stale: false, cacheAgeSec, servedFrom: 'fresh-cache' } };
+  }
+
+  let flight = INFLIGHT.get(key);
+  if (!flight) {
+    flight = fetchSectionLive(url, raw).finally(() => INFLIGHT.delete(key));
+    INFLIGHT.set(key, flight);
+  }
+
+  try {
+    const fresh = await flight;
+    if (fresh.status === 404) return { status: 404 };
+    if (kv) {
+      kv.put(key, JSON.stringify({ cachedAt: now, html: fresh.html } satisfies CachedPage), {
+        expirationTtl: KV_RETENTION_SEC,
+      }).catch(() => {
+        /* best-effort; a write failure must not fail an otherwise-successful live fetch */
+      });
+    }
+    return { status: 200, html: fresh.html, cache: { stale: false, cacheAgeSec: 0, servedFrom: 'upstream' } };
+  } catch (e) {
+    if (cached && cacheAgeSec !== null && cacheAgeSec < FRESH_SEC + STALE_MAX_SEC) {
+      return { status: 200, html: cached.html, cache: { stale: true, cacheAgeSec, servedFrom: 'stale-cache' } };
+    }
+    throw e;
+  }
+}
+
+function dataAsOf(meta: CacheMeta): string {
+  return new Date(Date.now() - meta.cacheAgeSec * 1000).toISOString();
+}
 
 const tools: McpToolExport['tools'] = [{
   name: 'wi_statute',
@@ -862,14 +992,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       hint: 'Wisconsin sections look like "940.01" (homicide) or "346.63" (OWI).' };
   }
   const url = `${BASE}${encodeURIComponent(raw)}`;
-  const res = await pwFetch(url, { headers: { 'User-Agent': UA } });
-  if (res.status === 404) {
+  const page = await fetchSectionPage(url, raw, kvFromArgs(args));
+  if (page.status === 404) {
     return { found: false, reason: 'section_not_found', section: raw,
       message: `No section ${raw} in the Wisconsin Statutes (HTTP 404).`,
       hint: 'Section numbers are not contiguous — repealed sections are normal.' };
   }
-  if (!res.ok) throw new Error(`Wisconsin Legislature returned HTTP ${res.status} for ${raw}`);
-  const html = await res.text();
+  const html = page.html;
 
   // Assemble from subsection spans that name this section, in document order.
   const esc = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -896,6 +1025,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     text: body, text_chars: body.length, url,
     source: 'Wisconsin Legislature (docs.legis.wisconsin.gov), keyless',
     attribution: 'Wisconsin statutes are public record.',
+    served_from: page.cache.servedFrom, stale: page.cache.stale,
+    cache_age_sec: page.cache.cacheAgeSec, data_as_of: dataAsOf(page.cache),
   };
 }
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
