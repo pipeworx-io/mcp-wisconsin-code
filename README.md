@@ -2,7 +2,7 @@
 
 Keyless. `940.01` is first-degree intentional homicide.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1743+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1857+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this one is assembled, not sliced
 
@@ -13,9 +13,48 @@ to (`data-cites="statutes/940.01(1)(a)"`), so the text is assembled from those
 spans. When a page tells you what each fragment is, use that rather than
 inferring from position.
 
+## Stored copy and `data_as_of` (fleet #3581)
+
+The Legislature's site answers US data centres but refuses or stalls from
+Singapore: over 7 days only 7 of 176 external calls succeeded (US callers
+57 of 57). A cache cannot help a first touch, so the statutes are stored, one
+JSON object per chapter, in the shared statute store (R2, `statutes/wi/`) that
+the Illinois, Indiana, North Carolina and Wyoming packs also use. The gateway
+hands the pack its R2 binding and the pack reads only the chapter a call names.
+A section found there is answered with no upstream request; the response says
+`served_from: "stored-copy"` and carries `data_as_of` (when that chapter was
+last read from the source). A section the copy cannot answer (chapter missing,
+or listed with no stored text) falls back to the live read with its short-lived
+cache. (fleet #3596: the copy used to be 470 files in git, 47.7 MiB in every
+worktree, re-uploaded to KV on every gateway deploy.)
+
+Nothing is loaded at module scope: the data never enters the gateway bundle.
+
+## Refresh
+
+```
+node mcps/wisconsin-code/scripts/bake-chapters.mjs            # all chapters -> mcps/wisconsin-code/.bake/
+node mcps/wisconsin-code/scripts/bake-chapters.mjs --only 940 # one chapter
+node mcps/wisconsin-code/scripts/bake-chapters.mjs --resume   # skip chapters already on disk
+node mcps/wisconsin-code/scripts/upload-chapters.mjs          # publish to R2 (statutes/wi/), changed chapters only
+```
+
+Sequential, with a delay between requests and an honest user agent. Exit 0
+only if every chapter in the table of contents was fetched and parsed and the
+totals clear the floors (default 400 chapters, 12,000 sections with text); any
+section that cannot be fetched leaves its chapter's previous file untouched
+and the run exits 1 with the counts. A chapter whose text is unchanged keeps
+its previous `data_as_of`. The baked files are a working copy, not committed
+(`.bake/` is gitignored); `upload-chapters.mjs` writes only the chapters whose
+content hash differs from the one recorded in `statutes/wi/_manifest.json`, so
+a refresh that finds nothing new writes nothing. It uses
+`wrangler r2 object put --remote` under the operator login; no API token.
+
 ## Data source
 
-Wisconsin Legislature. Statutes are public record.
+Wisconsin Legislature, Wisconsin Statutes. Wisconsin statutes are public
+record; this pack reads the published statutes and republishes no
+annotations.
 
 ## Quick Start
 
@@ -61,7 +100,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1743+ data sources. The
+Both URLs reach the same gateway and the same 1857+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -75,10 +114,12 @@ curl -X POST https://gateway.pipeworx.io/v1/tools/wi_statute \
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/wi_statute`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
-## Standalone (no gateway account)
+## Run it from npm
 
-This package also runs as a local stdio MCP server — no Pipeworx account, no
-gateway round-trip:
+`@pipeworx/mcp-wisconsin-code` is a local stdio bridge to the Pipeworx gateway: your MCP client
+starts it with `npx`, and it forwards every call to the same
+`https://gateway.pipeworx.io/wisconsin-code/mcp` endpoint shown above. It needs network access;
+there is no offline mode.
 
 ```json
 {
@@ -91,15 +132,18 @@ gateway round-trip:
 }
 ```
 
-Or run it directly to confirm it starts:
+Without a key it calls anonymously, capped at 50 calls a day. A free account
+raises that to 200 a day: get a key at https://pipeworx.io/signup and add
+`"env": { "PIPEWORX_API_KEY": "<your key>" }` to the server entry.
+The key is sent as a Bearer token, the same way a hosted connection sends it,
+so calls are metered and billed exactly as they are there.
 
-```bash
-npx -y @pipeworx/mcp-wisconsin-code
-```
+It lists **only** this pack's tools by default. Set `PIPEWORX_META_TOOLS=1` to
+also list `ask_pipeworx` and the other gateway-wide tools.
 
-It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
-for **only** this pack's tools — none of the shared meta-tools the gateway
-connection above adds. Same source, same tools, no ask_pipeworx routing.
+Behind an HTTPS proxy: Node's built-in `fetch` does not read `HTTPS_PROXY` by
+default. Newer Node releases honour it when `NODE_USE_ENV_PROXY=1` is set; check
+your Node version's documentation.
 
 ## Using with ask_pipeworx
 
