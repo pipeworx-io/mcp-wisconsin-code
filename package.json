@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-wisconsin-code",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Wisconsin Statutes — state statutes by citation.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "wisconsin-code",
     "gatewaySlug": "wisconsin-code",
-    "sourceHash": "v1-6556b853eb001b11513492832d725c7f415ca57402815d5a0871e74b36f914cf",
-    "sourceCommit": "98853f34516646cb7c4c1460f09249b262c0269e"
+    "sourceHash": "v1-9149cde9bb9588f20acbe01f91cdc60507e07ff403be66b78b5240ba19905af2",
+    "sourceCommit": "78b905fa3a6880dfb85c79150f4bffe8cf50ef00"
   }
 }
